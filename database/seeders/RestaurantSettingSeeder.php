@@ -12,7 +12,7 @@ use Illuminate\Support\Facades\App;
 class RestaurantSettingSeeder extends Seeder
 {
     /**
-     * Branch locations used for every seeded restaurant (Jaipur first, then Delhi).
+     * Branch locations used for every seeded restaurant (Dhaka first, then Delhi).
      *
      * @return array<int, array{name: string, address: string, lat: float, lng: float}>
      */
@@ -20,16 +20,16 @@ class RestaurantSettingSeeder extends Seeder
     {
         return [
             [
-                'name' => 'Jaipur',
-                'address' => '45, MI Road, C Scheme, Jaipur, Rajasthan 302001, India',
-                'lat' => 26.9124336,
-                'lng' => 75.7872719,
+                'name' => 'Dhaka',
+                'address' => '45, MI Road, C Scheme, Dhaka, Bangladesh 1205, Bangladesh',
+                'lat' => 23.810332,
+                'lng' => 90.412518,
             ],
             [
-                'name' => 'Delhi',
-                'address' => '12, Connaught Place, New Delhi, Delhi 110001, India',
-                'lat' => 28.6284541,
-                'lng' => 77.2069816,
+                'name' => 'Rajbari',
+                'address' => '12, Binodpur, Rajbari Sadar, Bangladesh 7700, Bangladesh',
+                'lat' => 23.7572,
+                'lng' => 89.6461,
             ],
         ];
     }
@@ -87,18 +87,18 @@ class RestaurantSettingSeeder extends Seeder
         ];
 
         $branches = $this->branchLocations();
-        $jaipur = $branches[0];
+        $dhaka = $branches[0];
 
         for ($i = 0; $i < $count; $i++) {
             $this->command->info('Seeding Restaurant: ' . ($i + 1));
 
-            $companyName = $i === 0 ? 'Demo Restaurant' : ($restaurantNames[$i] ?? fake()->company());
+            $companyName = $i === 0 ? 'Smart Restaurant' : ($restaurantNames[$i] ?? fake()->company());
 
             $setting = new Restaurant();
             $setting->name = $companyName;
-            $setting->address = $i === 0 ? $jaipur['address'] : fake()->address();
+            $setting->address = $i === 0 ? $dhaka['address'] : fake()->address();
             $setting->phone_number = fake()->e164PhoneNumber();
-            $setting->timezone = $country?->countries_code === 'IN' ? 'Asia/Kolkata' : 'America/New_York';
+            $setting->timezone = $country?->countries_code === 'IN' ? 'Asia/Dhaka' : 'America/New_York';
             $setting->theme_hex = '#A78BFA';
             $setting->theme_rgb = '167, 139, 250';
             $setting->email = str()->slug($companyName, '.') . '@example.com';
