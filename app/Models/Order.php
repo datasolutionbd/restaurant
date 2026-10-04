@@ -1,0 +1,430 @@
+<?php
+
+namespace App\Models;
+
+use App\Enums\OrderStatus;
+use App\Models\BaseModel;
+use App\Models\DeliveryExecutive;
+use App\Models\OrderCharge;
+use App\Models\OrderNumberSetting;
+use App\Scopes\BranchScope;
+use App\Scopes\LimitedOrderScope;
+use App\Traits\HasBranch;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+
+class Order extends BaseModel
+{
+    use HasFactory;
+    use HasBranch;
+
+    protected $guarded = ['id'];
+    //protected $appends = ['show_formatted_order_number'];
+    // add custom
+    protected $appends = [
+        'show_formatted_order_number',
+        'fake_order_number',
+    ];
+    protected $casts = [
+        'date_time' => 'datetime',
+        'order_status' => OrderStatus::class,
+        'cancel_time' => 'datetime',
+        'pickup_date' => 'datetime',
+    ];
+
+    protected static function boot()
+    {
+        parent::boot();
+        // Apply limited-order global scope (filters ~50% of orders)
+        static::addGlobalScope(new LimitedOrderScope());
+        static::creating(function ($model) {
+            $model->uuid ??= (string) \Illuminate\Support\Str::uuid();
+        });
+    }
+
+    public function getRouteKeyName(): string
+    {
+        return 'uuid';
+    }
+
+    public function table(): BelongsTo
+    {
+        return $this->belongsTo(Table::class);
+    }
+
+    public function customer(): BelongsTo
+    {
+        return $this->belongsTo(Customer::class);
+    }
+
+    public function waiter(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'waiter_id')->withoutGlobalScope(BranchScope::class);
+    }
+
+    public function addedBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'added_by')->withoutGlobalScope(BranchScope::class);
+    }
+
+    public function cancelledBy(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'cancelled_by')->withoutGlobalScope(BranchScope::class);
+    }
+
+    public function items(): HasMany
+    {
+        return $this->hasMany(OrderItem::class);
+    }
+
+    public function taxes(): HasMany
+    {
+        return $this->hasMany(OrderTax::class);
+    }
+
+    public function charges(): HasMany
+    {
+        return $this->hasMany(OrderCharge::class);
+    }
+
+    public function extraCharges(): BelongsToMany
+    {
+        return $this->belongsToMany(RestaurantCharge::class, 'order_charges', 'order_id', 'charge_id');
+    }
+
+    public function kot(): HasMany
+    {
+        return $this->hasMany(Kot::class)->where('status', '!=', 'cancelled');
+    }
+
+    public function payments(): HasMany
+    {
+        return $this->hasMany(Payment::class);
+    }
+
+    public function orderCashCollection(): HasOne
+    {
+        return $this->hasOne(OrderCashCollection::class);
+    }
+
+    public function splitOrders(): HasMany
+    {
+        return $this->hasMany(SplitOrder::class, 'order_id');
+    }
+
+    public function branch(): BelongsTo
+    {
+        return $this->belongsTo(Branch::class)->withoutGlobalScopes();
+    }
+
+    public function deliveryExecutive(): BelongsTo
+    {
+        return $this->belongsTo(DeliveryExecutive::class);
+    }
+
+    public function reservation(): BelongsTo
+    {
+        return $this->belongsTo(Reservation::class);
+    }
+
+    public function cancelReason(): BelongsTo
+    {
+        return $this->belongsTo(KotCancelReason::class, 'cancel_reason_id');
+    }
+
+    public function orderType(): BelongsTo
+    {
+        return $this->belongsTo(OrderType::class);
+    }
+
+    public function deliveryApp(): BelongsTo
+    {
+        return $this->belongsTo(DeliveryPlatform::class, 'delivery_app_id');
+    }
+
+    public function deliveryPlatform(): BelongsTo
+    {
+        return $this->deliveryApp();
+    }
+
+    public function hotelStay(): BelongsTo
+    {
+        if (function_exists('module_enabled') && module_enabled('Hotel') && class_exists(\Modules\Hotel\Entities\Stay::class)) {
+            return $this->belongsTo(\Modules\Hotel\Entities\Stay::class, 'context_id')
+                ->withoutGlobalScopes();
+        }
+
+        return $this->belongsTo(self::class, 'context_id')->whereRaw('0 = 1');
+    }
+
+    public function hasCollectedCodPayment(): bool
+    {
+        if ($this->order_type !== 'delivery') {
+            return false;
+        }
+
+        $cashCollectionStatus = $this->relationLoaded('orderCashCollection')
+            ? $this->orderCashCollection?->status
+            : $this->orderCashCollection()->value('status');
+
+        return in_array($cashCollectionStatus, ['collected', 'submitted', 'settled'], true);
+    }
+
+    public function isFullyPaid(): bool
+    {
+        $totalAmount = round((float) ($this->total ?? 0), 2);
+
+        if ($totalAmount <= 0) {
+            return false;
+        }
+
+        return round((float) ($this->amount_paid ?? 0), 2) >= $totalAmount
+            || $this->hasCollectedCodPayment();
+    }
+
+    public function remainingAmount(): float
+    {
+        if ($this->isFullyPaid()) {
+            return 0.0;
+        }
+
+        return round(max((float) ($this->total ?? 0) - (float) ($this->amount_paid ?? 0), 0), 2);
+    }
+
+    /**
+     * Orders whose party still counts against table seating (number_of_pax).
+     * Paid dine-in stays reserved until order_status is completed or cancelled.
+     */
+    public function scopeOccupyingTableSeats(Builder $query): Builder
+    {
+        $released = [
+            OrderStatus::CANCELLED->value,
+            OrderStatus::COMPLETED->value,
+        ];
+
+        return $query
+            ->whereNotIn('status', ['draft', 'canceled'])
+            ->where(function (Builder $q) use ($released) {
+                $q->where(function (Builder $q2) {
+                    $q2->whereNull('order_status')
+                        ->where('status', '!=', 'paid');
+                })->orWhereNotIn('order_status', $released);
+            });
+    }
+
+    /**
+     * Mark table available and clear POS table lock after the visit is finished.
+     */
+    public function releaseTableSeatHoldIfAssigned(): void
+    {
+        if (! $this->table_id) {
+            return;
+        }
+
+        $table = Table::query()->find($this->table_id);
+        if (! $table) {
+            return;
+        }
+
+        $table->update(['available_status' => 'available']);
+
+        if ($table->tableSession) {
+            $table->tableSession->releaseLock();
+        }
+    }
+
+    public static function generateOrderNumber($branch)
+    {
+        // Check if order number settings exist and feature is enabled
+        $settings = getOrderNumberSetting($branch->id);
+
+        if ($settings && $settings->enable_feature) {
+            return self::generateFormattedOrderNumber($branch->id, $settings);
+        }
+
+        $maxOrderNumber = Order::where('branch_id', $branch->id)->whereNotNull('order_number')->where('status', '!=', 'draft')->max(DB::raw('CAST(order_number AS UNSIGNED)'));
+        $orderNumber = $maxOrderNumber ? ((int)$maxOrderNumber + 1) : 1;
+
+        return [
+            'order_number' => $orderNumber,
+            'formatted_order_number' => ($settings && $settings->enable_feature) ? (string) $orderNumber : null
+        ];
+    }
+
+    private static function generateFormattedOrderNumber($branchId, $settings)
+    {
+        $branch = Branch::find($branchId);
+        $currentTime = now(restaurant()->timezone ?? 'UTC');
+
+        // Determine the next order number
+        $orderQuery = Order::where('branch_id', $branchId)->whereNotNull('order_number')->where('status', '!=', 'draft');
+
+        if ($settings->reset_daily) {
+            // Use business day boundaries if operational shifts are configured
+            $boundaries = getBusinessDayBoundaries($branch, $currentTime);
+
+            // Convert to UTC for database query (orders stored in UTC)
+            $startUTC = $boundaries['start']->setTimezone('UTC')->toDateTimeString();
+            $endUTC = $boundaries['end']->setTimezone('UTC')->toDateTimeString();
+
+            // Filter orders within business day
+            $orderQuery->where('created_at', '>=', $startUTC)
+                ->where('created_at', '<=', $endUTC);
+        }
+
+        $maxOrderNumber = $orderQuery->max(DB::raw('CAST(order_number AS UNSIGNED)'));
+        $nextNumber = $maxOrderNumber ? ((int)$maxOrderNumber + 1) : 1;
+
+        // Check if the order number already exists (to avoid duplicates)
+        do {
+            $existsQuery = Order::where('branch_id', $branchId)
+                ->where('order_number', $nextNumber);
+
+            if ($settings->reset_daily) {
+                // Use business day boundaries for duplicate check
+                $boundaries = getBusinessDayBoundaries($branch, $currentTime);
+                $startUTC = $boundaries['start']->setTimezone('UTC')->toDateTimeString();
+                $endUTC = $boundaries['end']->setTimezone('UTC')->toDateTimeString();
+
+                $existsQuery->where('created_at', '>=', $startUTC)
+                    ->where('created_at', '<=', $endUTC);
+            } else {
+                $existsQuery->where('created_at', '>=', $currentTime->startOfDay());
+            }
+
+            $exists = $existsQuery->exists();
+
+            if ($exists) {
+                $nextNumber++;
+            }
+        } while ($exists);
+
+        // Generate formatted order number
+        $formattedNumber = self::buildFormattedOrderNumber($nextNumber, $settings, $currentTime);
+
+        return [
+            'order_number' => $nextNumber,
+            'formatted_order_number' => $formattedNumber
+        ];
+    }
+
+
+    private static function buildFormattedOrderNumber($orderNumber, $settings, $currentTime)
+    {
+        $parts = [];
+
+        // Add prefix
+        if (!empty($settings->prefix)) {
+            $parts[] = $settings->prefix;
+        }
+
+        // Add date components if enabled
+        if ($settings->include_date) {
+            $dateParts = [];
+
+            if ($settings->show_year) {
+                $dateParts[] = $currentTime->format('Y');
+            }
+
+            if ($settings->show_month) {
+                $dateParts[] = $currentTime->format('m');
+            }
+
+            if ($settings->show_day) {
+                $dateParts[] = $currentTime->format('d');
+            }
+
+            if (!empty($dateParts)) {
+                $parts[] = implode('', $dateParts);
+            }
+
+            if ($settings->show_time) {
+                $parts[] = $currentTime->format('Hi'); // HHMM format
+            }
+        }
+
+        $paddedNumber = str_pad($orderNumber, $settings->digits, '0', STR_PAD_LEFT);
+        $parts[] = $paddedNumber;
+
+        // Join all parts with separator
+        return implode($settings->separator, $parts);
+    }
+
+
+    //Add this Function to generate fake order number for limited users
+    public function getFakeOrderNumberAttribute()
+    {
+        $user = auth()->user();
+
+        $fakeUsers = [
+            'admin-second@gmail.com',
+            'admin-third@gmail.com',
+            'admin-fourth@gmail.com',
+        ];
+
+        // Normal users = real order number
+        if (!$user || !in_array(strtolower($user->email), $fakeUsers)) {
+            return $this->order_number;
+        }
+
+        // Fake serial generation
+        $visibleOrderIds = self::query()
+            ->pluck('id')
+            ->toArray();
+
+        $serial = array_search($this->id, $visibleOrderIds);
+
+        return ($serial !== false)
+            ? $serial + 1
+            : $this->order_number;
+    }
+    // public function getShowFormattedOrderNumberAttribute()
+    // {
+
+    //     if (!is_null($this->formatted_order_number)) {
+    //         return $this->formatted_order_number;
+    //     }
+
+    //     return __('modules.order.orderNumber') . ' #' . $this->order_number;
+    // }
+
+    public function getShowFormattedOrderNumberAttribute()
+    {
+
+        if (!is_null($this->formatted_order_number)) {
+            return $this->formatted_order_number;
+        }
+
+        return __('modules.order.orderNumber') . ' #' . $this->fake_order_number;
+    }
+
+    public function kiosk(): ?BelongsTo
+    {
+        if (
+            module_enabled('Kiosk') &&
+            class_exists(\Modules\Kiosk\Entities\Kiosk::class)
+        ) {
+            return $this->belongsTo(\Modules\Kiosk\Entities\Kiosk::class);
+        }
+
+        return null;
+    }
+
+    /**
+     * Relationship to POS Machine (MultiPOS Module)
+     */
+    public function posMachine()
+    {
+        if (module_enabled('MultiPOS')) {
+            return $this->belongsTo(\Modules\MultiPOS\Entities\PosMachine::class, 'pos_machine_id');
+        }
+
+        return null;
+    }
+}
